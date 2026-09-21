@@ -52,7 +52,14 @@ class Ensembler:
 
         B_, S_, H_, CQ_ = masked_preds.shape
         flat      = masked_preds.reshape(B_ * S_, H_, CQ_)                       # (B*S, H, C*Q)
+
+        # For a shared target date a larger h holds an OLDER forecast, so the causal
+        # pool for horizon h is h..H-1 (this FCD and earlier), not 0..h. The kernels
+        # below all accumulate over 0..i, so reverse the horizon axis around them.
+        flat      = flat[:, ::-1, :]
         ensembled = self.ensembler(flat, **self.kwargs)                           # (B*S, H, C*Q)
+        ensembled = ensembled[:, ::-1, :]
+
         ensembled = ensembled.reshape(B_, S_, H_, CQ_)                           # (B, S, H, C*Q)
 
         out = self.ensembled_preds_reshape_for_windows(ensembled)                # (B, T, H, C*Q)
