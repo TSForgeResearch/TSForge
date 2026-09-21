@@ -162,8 +162,10 @@ def forecast_percentage_change(preds, stride=1, symmetric=True, mask=None, eps=1
         symmetric=False (FPC):
             mean( |ŷ_update - ŷ_before| / (|ŷ_before| + ε) )
 
-    When scaling=False, the denominator is dropped and this reduces to mean absolute
-    revision scaled by 200. Higher values indicate greater forecast instability.
+    These are two different quantities, not two scalings of one: sFPC is symmetric in
+    the two forecasts and bounded in [0, 200], while FPC divides by the older forecast
+    alone, is unbounded, and carries no factor of 200. Higher values indicate greater
+    forecast volatility in both cases.
 
     Parameters
     ----------
