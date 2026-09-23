@@ -353,7 +353,8 @@ class DataLoaderFactory:
             batch_mixing_strategy = self.mcfg.batch_mixing_strategy,
             shuffle               = True,
             drop_last             = self.mcfg.drop_last,
-            seed                  = getattr(self.mcfg, "seed", 0),
+            seed                  = getattr(self.mcfg, "seed", 42),
+            weighted_batches      = getattr(self.mcfg, "weighted_batches", True),
             rank                  = rank,
             world_size            = world_size,
         )

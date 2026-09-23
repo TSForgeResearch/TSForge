@@ -1,11 +1,19 @@
 # ── Random seed ────────────────────────────────────────────
 seed: 1
+deterministic: true       # cudnn deterministic kernels, and raise on any op with
+                          # no deterministic CUDA implementation rather than let
+                          # it vary silently. Off only for profiling.
 
 # ── Scaling ────────────────────────────────────────────
 scaler_type: 'standard'
 
 # ── Loss ────────────────────────────────────────────
-loss_space: 'denorm' #'denorm'
+loss_space: 'norm'   # 'norm' | 'denorm'. In denorm the loss is computed in the
+                     # data's original units, so a high-magnitude series
+                     # contributes far more gradient than a low-magnitude one
+                     # regardless of any weight assigned to it (measured on
+                     # M-comp yearly: grad-norm spread ~1000x in denorm vs ~4x
+                     # in norm). Use 'norm' for anything that weights series.
 
 # ── DataLoader ──────────────────────────────────────────
 batch_size: 8
@@ -14,8 +22,13 @@ num_workers: 4
 drop_last: false
 lazy_loading: true        # True: datasets loaded on-demand, max_cached_datasets held in RAM at once; False: all datasets loaded into RAM at startup
 max_cached_datasets: 10   # (lazy_loading=True only) max datasets held in memory simultaneously; LRU eviction when exceeded
-batch_sampler: HorizonBatchSampler 
 batch_mixing_strategy: concat # Options: concat, round_robin
+weighted_batches: true    # false → per-dataset `weight` is ignored when building
+                          # batches (uniform = equal slots per dataset). Weights
+                          # stay readable in the config for loss-side weighting.
+                          # Set false when comparing a loss-weighting condition
+                          # against a sampling-weighting one, so both see
+                          # identical batches.
 val_strategy: "exhaustive"  # full pass every val check (default)
                             # val_strategy: "random_datasets"   # option A — K random datasets per val check
                             # val_max_datasets: 4               # Only used for val_strategy "random_datasets"
@@ -27,6 +40,9 @@ max_steps: 50           # total optimiser steps (replaces max_epochs)
 val_check_interval: 10      # run validation every N steps
 early_stopping_patience: 10   # number of val checks without improvement before stopping
 learning_rate: 1e-4
+weight_decay: 1.0e-2      # was hardcoded in 3 call sites
+betas: [0.9, 0.999]       # was an implicit torch default
+eps: 1.0e-8               # was an implicit torch default
 fcd_samples: 10 # 1 for windows-sampling and >1 for forking-sequences
 fcd_samples_eval: null # Two modes only:
                        #   null: mirror fcd_samples, so eval blocks have the
@@ -37,8 +53,29 @@ fcd_samples_eval: null # Two modes only:
                        # Any other value is rejected.
 fcd_sampler: heterogeneous
 loss: "quantile"
+loss_reduction: per_series  # 'per_series' | 'flat'
+                            # per_series: mean within each series, then mean
+                            #   across series — every series counts once.
+                            # flat: one mean over all windows of all series
+                            #   pooled, so a series' influence is proportional
+                            #   to how many live windows/steps it has. Measured
+                            #   on M-comp yearly that spread is 6x at
+                            #   fcd_samples=1 and 279x at 96, i.e. flat weights
+                            #   series by length. It also distorts any
+                            #   per-series weighting: the effective weight
+                            #   becomes w_i * n_i instead of w_i.
 quantiles: [0.1, 0.5, 0.9]
-gradient_clip_val: 1.0
+gradient_clip_val: 10.0   # anomaly guard only, NOT a per-step normaliser.
+                          # Measured on the yearly group in norm space over 500
+                          # steps: grad-norm median 2.7, p99 4.9, max 5.7 — so
+                          # 10.0 never binds in normal training and catches only
+                          # genuine excursions. The previous 1.0 bound on 100% of
+                          # steps, i.e. normalised gradient descent every step.
+                          # Avoid 2-4: partial clipping makes training sensitive
+                          # to loss scale (1.1e-3 relative parameter divergence
+                          # from a pure loss rescale, vs 3.7e-8 when clipping
+                          # either always or never binds). Re-measure for other
+                          # dataset groups — this is the yearly geometry.
 optimizer_name: "AdamW"
 
 # ── Checkpointing ─────────────────────────────────────────────

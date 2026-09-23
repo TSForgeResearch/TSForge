@@ -32,6 +32,7 @@ class HorizonBatchSampler(Sampler):
         seed=0,
         rank=0,
         world_size=1,
+        weighted_batches=True,
     ):
         self.group_datasets  = group_datasets
         self.group_weights   = group_weights
@@ -40,6 +41,7 @@ class HorizonBatchSampler(Sampler):
         self.batch_mixing_strategy = batch_mixing_strategy
         self.shuffle         = shuffle
         self.drop_last       = drop_last
+        self.weighted_batches = weighted_batches
         self.seed            = seed
         self.rank            = rank
         self.world_size      = world_size
@@ -70,7 +72,18 @@ class HorizonBatchSampler(Sampler):
             return batches
 
         total     = sum(len(a) for a in per_ds)
-        w_arr     = np.array(weights, dtype=np.float64)
+        # weighted_batches=False ignores the per-dataset weights when building
+        # batches, so batch composition is identical no matter what a given
+        # condition does with `weight` — which is what lets a loss-weighting
+        # run be compared against a sampling-weighting one. The weights stay
+        # readable in the config for loss-side use.
+        #
+        # Note "uniform" here means equal slots per dataset, not slots
+        # proportional to dataset size. With every source at weight 1.0 this
+        # reproduces exactly the batches the weighted path already produced.
+        w_arr     = (np.ones(len(per_ds), dtype=np.float64)
+                     if not self.weighted_batches
+                     else np.array(weights, dtype=np.float64))
         w_arr     = w_arr / w_arr.sum()
         slots_per = (w_arr * total).round().astype(int)
         slots_per[np.argmax(slots_per)] += total - slots_per.sum()

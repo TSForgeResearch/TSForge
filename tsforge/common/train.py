@@ -11,6 +11,7 @@ from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ..dataloaders.factory import DataLoaderFactory
+from ._utils import build_optimizer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,9 +49,7 @@ def train(
     -------
     Final validation metrics dict.
     """
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=mcfg.learning_rate, weight_decay=1e-2,
-    )
+    optimizer = build_optimizer(model.parameters(), mcfg)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=mcfg.max_steps, eta_min=mcfg.learning_rate / 10,
     )
@@ -138,9 +137,7 @@ def _distributed_worker(
     ddp_model   = DDP(model, device_ids=[rank], find_unused_parameters=False)
     inner_model = ddp_model.module
 
-    optimizer = torch.optim.AdamW(
-        ddp_model.parameters(), lr=mcfg.learning_rate, weight_decay=1e-2,
-    )
+    optimizer = build_optimizer(ddp_model.parameters(), mcfg)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=mcfg.max_steps, eta_min=mcfg.learning_rate / 10,
     )

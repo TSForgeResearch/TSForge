@@ -13,6 +13,7 @@ from tsforge.models.rnn import RNN
 from tsforge.models.cnn import CNN
 from tsforge.dataloaders.factory import DataLoaderFactory
 from tsforge.common.train import train, eval_test
+from tsforge.common._utils import set_determinism
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +62,19 @@ def main(cfg: DictConfig) -> None:
 
     if mcfg.horizon_override:
         mcfg.horizon = mcfg.horizon_override
+
+    # ── Determinism ──────────────────────────────────────────────────────────
+    # MUST stay above model construction. theta_0 is drawn from the global
+    # torch stream, and torch's default seed is randomised per process, so a
+    # model built before this call gets different weights on every run. The
+    # torch.manual_seed inside fit() runs afterwards and cannot recover them.
+    #
+    # Safe to move earlier, never later. If you add anything above this line
+    # that consumes RNG, this call still fixes everything below it.
+    set_determinism(
+        seed   = mcfg.seed,
+        strict = getattr(mcfg, "deterministic", True),
+    )
 
     factory = DataLoaderFactory(mcfg, dcfg)
     train_loader = factory.train_dataloader()

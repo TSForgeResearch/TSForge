@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 import torch.distributed as dist
 from tqdm import tqdm
 
-from ._utils import CheckpointManager, EarlyStopper
+from ._utils import CheckpointManager, EarlyStopper, build_optimizer, mix_seed
 from ..dataloaders._forking_sequences import ForkingSequences
 from ..metrics.torch_losses import get_loss
 from ..scalers.torch_scalers import Scaler
@@ -43,10 +43,11 @@ class _InfiniteLoader:
         
 
 class _BaseLoss(nn.Module):
-    def __init__(self, loss_fn, scaler):
+    def __init__(self, loss_fn, scaler, reduction: str = "per_series"):
         super().__init__()
-        self.loss_fn = loss_fn
-        self.scaler  = scaler
+        self.loss_fn   = loss_fn
+        self.scaler    = scaler
+        self.reduction = reduction
 
     def _compute(self, batch):
         y, preds = batch["outsample_y"], batch["preds"]
@@ -54,7 +55,36 @@ class _BaseLoss(nn.Module):
         y = y.reshape(B * T, H, C)
         preds = preds.reshape(B * T, H, C, -1)
         mask = batch["outsample_mask"].reshape(B * T, H, C).float()
-        return self.loss_fn(preds=preds, targets=y, mask=mask)
+
+        if self.reduction == "flat":
+            return self.loss_fn(preds=preds, targets=y, mask=mask)
+
+        # ── per_series ───────────────────────────────────────────────────────
+        # The flat mean pools every window of every series into one bag, so a
+        # series influences the gradient in proportion to how many live
+        # elements it contributed. Measured on M-competition yearly, that
+        # spread is 6x at fcd_samples=1 and 279x at fcd_samples=96 — i.e. the
+        # flat mean silently weights series by length.
+        #
+        # Averaging within each series first, then across series, makes every
+        # series count once regardless of length. That also makes a per-series
+        # weight applied downstream mean what it says: under the flat mean the
+        # effective weight is w_i * n_i, here it is w_i.
+        per_elem = self.loss_fn(preds=preds, targets=y, mask=mask, reduction="none")
+
+        # Blocked eval folds blocks into the batch dim (b-major, block-minor),
+        # so regroup them into their original series before reducing.
+        n_blocks = int(batch.get("n_blocks", 1))
+        B_true   = B // n_blocks
+
+        num   = (per_elem * mask).reshape(B_true, -1).sum(dim=1)
+        den   = mask.reshape(B_true, -1).sum(dim=1)
+        ell   = num / den.clamp(min=1)                      # per-series mean
+        valid = (den > 0).to(ell.dtype)
+
+        # A series with no live window in this batch has no defined loss, so it
+        # is dropped from the average rather than counted as zero.
+        return (ell * valid).sum() / valid.sum().clamp(min=1)
 
 class DenormSpaceLoss(_BaseLoss):
     """Denorms preds before computing loss."""
@@ -124,7 +154,8 @@ class BaseModel(nn.Module):
             patch_len = config.patch_len,
             stride = config.stride,
             fcd_sampler = config.fcd_sampler,
-            norm_window_size = norm_window_size
+            norm_window_size = norm_window_size,
+            fcd_seed = getattr(config, "seed", 0),
         )
         # Eval block size — exactly two sanctioned modes:
         #   None (default) → mirror fcd_samples, so every eval block has the
@@ -184,10 +215,19 @@ class BaseModel(nn.Module):
 
         self.loss_fn = loss_fn
 
+        reduction = getattr(config, "loss_reduction", "per_series")
+        if reduction not in ("flat", "per_series"):
+            raise ValueError(
+                f"loss_reduction must be 'flat' or 'per_series', got {reduction!r}."
+            )
+        self.loss_reduction = reduction
+
         if config.loss_space == 'norm':
-            self.compute_loss = NormSpaceLoss(loss_fn=loss_fn, scaler=self.scaler)
+            self.compute_loss = NormSpaceLoss(
+                loss_fn=loss_fn, scaler=self.scaler, reduction=reduction)
         elif config.loss_space == 'denorm':
-            self.compute_loss = DenormSpaceLoss(loss_fn=loss_fn, scaler=self.scaler)
+            self.compute_loss = DenormSpaceLoss(
+                loss_fn=loss_fn, scaler=self.scaler, reduction=reduction)
         else:
             raise Exception('Loss space not recognized.')
 
@@ -216,14 +256,41 @@ class BaseModel(nn.Module):
         self.seed         = seed
         self.global_step  = 0
 
+        # Single source of truth for FCD window sampling: it always derives
+        # from the training seed, so one seed defines an experiment. There is
+        # deliberately no separate fcd_seed config key — it would be silently
+        # overwritten here, and two seeds is one more thing to get out of sync
+        # between conditions.
+        #
+        # `seed` already carries the +rank offset applied by
+        # _distributed_worker, so ranks draw different windows — they hold
+        # different data slices. What matters for a controlled comparison is
+        # that rank k sees the same windows in every condition, which it does.
+        self._fork_sequences_train.fcd_seed = seed
+
         self.device = device or (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
         self.to(self.device)
 
-        self.optimizer = optimizer or torch.optim.AdamW(
-            self.parameters(), lr=mcfg.learning_rate, weight_decay=1e-2
-        )
+        # A custom loss passed to train()/setup_training() used to be accepted
+        # and then silently dropped — the loss stayed whatever config.loss built
+        # in __init__, so `train(loss_fn=...)` was a no-op. Wire it up.
+        if loss_fn is not None:
+            self.loss_fn = loss_fn
+            space = getattr(mcfg, "loss_space", "denorm")
+            reduction = getattr(mcfg, "loss_reduction", self.loss_reduction)
+            if space == "norm":
+                self.compute_loss = NormSpaceLoss(
+                    loss_fn=loss_fn, scaler=self.scaler, reduction=reduction)
+            elif space == "denorm":
+                self.compute_loss = DenormSpaceLoss(
+                    loss_fn=loss_fn, scaler=self.scaler, reduction=reduction)
+            else:
+                raise ValueError(f"Loss space {space!r} not recognized.")
+            self.compute_loss.to(self.device)
+
+        self.optimizer = optimizer or build_optimizer(self.parameters(), mcfg)
 
         self.early_stopper = EarlyStopper(
             patience = mcfg.early_stopping_patience,
@@ -258,7 +325,9 @@ class BaseModel(nn.Module):
         horizon = int(horizon_override) if horizon_override else int(raw_batch["horizon"][0].item())
         if self.training:
             fcd_samples = self._get_fcd_samples()
-            return self._fork_sequences_train(raw_batch, horizon, fcd_samples=fcd_samples)
+            return self._fork_sequences_train(
+                raw_batch, horizon, fcd_samples=fcd_samples, step=self.global_step,
+            )
         return self._fork_sequences_eval(raw_batch, horizon, fcd_samples=self.fcd_samples_eval)
 
 
@@ -270,6 +339,19 @@ class BaseModel(nn.Module):
     def train_step(self, raw_batch: Dict[str, Tensor]) -> float:
         self._assert_training_ready()
         self.train()
+
+        # Re-key the global RNG stream to this step. Dropout draws from it, so
+        # without this its masks depend on how much RNG everything else
+        # consumed — a loss function that draws a single random number shifts
+        # every subsequent dropout mask. Keying on (seed, global_step) makes
+        # dropout a pure function of the step, so two conditions differing
+        # only in their loss see identical masks.
+        #
+        # FCD window sampling does not rely on this (it has its own generator,
+        # keyed the same way), but the two now behave consistently: everything
+        # stochastic in a step is determined by the step number alone.
+        torch.manual_seed(mix_seed(self.seed, self.global_step))
+
         batch = self._prepare_batch(raw_batch)
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -414,6 +496,10 @@ class BaseModel(nn.Module):
     def fit(self) -> Dict[str, Dict[str, float]]:
         self._assert_training_ready()
 
+        # Deliberate second reseed, not redundant with set_determinism().
+        # Model construction consumes a variable amount of the global stream
+        # depending on architecture; this resets it to a known position so
+        # step 0 looks identical across conditions. Do not remove.
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -428,6 +514,7 @@ class BaseModel(nn.Module):
 
         primary    = next(iter(self.val_loaders)) if self.val_loaders else None
         train_iter = _InfiniteLoader(self.train_loader)
+        best_val   = float("inf")
         final_metrics: Dict[str, Dict[str, float]] = {}
         t0 = time.time()
 
@@ -454,6 +541,16 @@ class BaseModel(nn.Module):
                 self.val_losses.append((self.global_step, monitor_val))  # (step, loss)
                 final_metrics = val_metrics
                 self._log_val_metrics(val_metrics)
+
+                # Keep the best-val weights alongside the final ones. Early
+                # stopping returns the model `patience` checks PAST its best,
+                # so final.pt is systematically post-peak. Saving both lets the
+                # choice be made after the run rather than being forced here.
+                # Note eval_test() runs on the in-memory (final) model — load
+                # best.pt explicitly if that is the one you want to evaluate.
+                if monitor_val < best_val:          # NaN never compares True
+                    best_val = monitor_val
+                    self.save_state(self.ckpt_manager.checkpoint_dir / "best.pt")
 
                 if primary and primary in val_metrics:
                     monitor_val = val_metrics[primary].get("loss", float("nan"))

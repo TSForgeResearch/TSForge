@@ -2,6 +2,8 @@ from typing import Dict, Tuple, Optional
 import torch
 from torch import Tensor
 
+from ..common._utils import mix_seed
+
 
 def _gather_block(
     src:          Tensor,   # [B, S, C, *extra]
@@ -65,6 +67,14 @@ def _pad_right(src: Tensor, n_pad: int) -> Tensor:
     return torch.cat(
         [src, src.new_zeros(src.shape[0], n_pad, *src.shape[2:])], dim=1
     )
+
+
+#: Minimum real observations required in a window's normalization context for
+#: its statistics to be usable. Below 2 the variance is not estimable: with
+#: exactly one observation mean==x and mean_sq==x**2, so the variance is 0 and
+#: stdev collapses to sqrt(eps)~0.003, which inflates any real target ~300x.
+#: Windows under this threshold are dropped from the loss (see __call__).
+MIN_NORM_OBS = 2
 
 
 def n_valid_fcds(T: int, context_len: int, horizon: int, stride: int) -> int:
@@ -137,11 +147,19 @@ class ForkingSequences:
         fcd_sampler: str = "heterogeneous",
         norm_window_size: int = -1,
         blocked: bool = False,
+        fcd_seed: int = 0,
     ):
         if fcd_sampler not in self.SAMPLERS:
             raise ValueError(
                 f"fcd_sampler must be one of {self.SAMPLERS}, got '{fcd_sampler}'"
             )
+        # Window sampling draws from a dedicated generator keyed on
+        # (fcd_seed, step) rather than the global torch stream — see
+        # _generator(). Only the sampling strategies use it; the blocked and
+        # all-FCD strategies enumerate windows and never sample.
+        self.fcd_seed = fcd_seed
+        self._step = 0
+        self._gens = {}
         self.context_len = context_len
         self.patch_len = patch_len
         self.stride = stride
@@ -170,6 +188,25 @@ class ForkingSequences:
             self._strategy = self._sampled_fcds_full_context
         else:
             self._strategy = self._all_fcds_full_context
+
+    def _generator(self, device: torch.device) -> torch.Generator:
+        """
+        Generator keyed on (fcd_seed, step), re-seeded on every call.
+
+        Re-seeding rather than letting it advance is deliberate: it makes the
+        draw at step N a pure function of N, independent of how many times the
+        sampler ran before it. A run resumed from a checkpoint therefore sees
+        the same windows an uninterrupted run would.
+
+        The generator is bound to a device because multinomial on a CUDA
+        tensor requires a CUDA generator; cached per device so DDP ranks and
+        CPU tests both work without branching.
+        """
+        g = self._gens.get(device)
+        if g is None:
+            g = self._gens[device] = torch.Generator(device=device)
+        g.manual_seed(mix_seed(self.fcd_seed, self._step))
+        return g
 
     def _homogeneous_sampler(
         self,
@@ -208,10 +245,15 @@ class ForkingSequences:
 
         if sample_weights.sum() == 0:
             # fallback: no position valid for all series — just respect max_start
-            sample_weights = torch.ones(S)
+            # (device must match: a CPU index here would crash the CUDA gather
+            # in _gather_block — the heterogeneous path already gets this right)
+            sample_weights = torch.ones(S, device=sample_weights.device)
             sample_weights[max_start + 1:] = 0.0
 
-        window_start = torch.multinomial(sample_weights, num_samples=1)  # [1]
+        window_start = torch.multinomial(
+            sample_weights, num_samples=1,
+            generator=self._generator(sample_weights.device),
+        )  # [1]
         window_start = window_start.repeat(B)                            # [B]
         return window_start, block_len
 
@@ -282,10 +324,18 @@ class ForkingSequences:
         if zero_rows.any():
             fallback = torch.ones(S, device=sample_weights.device)
             fallback[max_start + 1:] = 0.0
-            sample_weights[zero_rows] = fallback
+            # torch.where, not `sample_weights[zero_rows] = fallback`: the
+            # deterministic index_put_ CUDA kernel mis-broadcasts a 1-D value
+            # into a boolean-mask selection and trips an internal assert
+            # (fires under torch.use_deterministic_algorithms(True), which
+            # set_determinism enables). where() is equivalent and unaffected.
+            sample_weights = torch.where(
+                zero_rows.unsqueeze(1), fallback.unsqueeze(0), sample_weights
+            )
 
         window_start = torch.multinomial(
-            sample_weights, num_samples=1
+            sample_weights, num_samples=1,
+            generator=self._generator(sample_weights.device),
         ).squeeze(1)
         return window_start, block_len
     
@@ -538,7 +588,17 @@ class ForkingSequences:
         batch: Dict[str, Tensor],
         horizon: int,
         fcd_samples: int = -1,
+        step: Optional[int] = None,
     ) -> Dict[str, Tensor]:
+        # Window draws key off (fcd_seed, step) so they never depend on how
+        # much of the global RNG stream anything else consumed — dropout,
+        # DataLoader worker seeding, a different loss function. Two runs
+        # differing only in their loss therefore see identical FCD windows on
+        # identical series at identical steps.
+        #
+        # Eval passes no step: its strategies enumerate windows, never sample.
+        if step is not None:
+            self._step = int(step)
 
         enc_block, mask_block, loss_mask_block, window_size, valid_fcds, window_start = self._strategy(
             batch=batch,
@@ -583,7 +643,7 @@ class ForkingSequences:
         stats = self._compute_norm_stats(x_full, mask_full)
         mean, stdev = stats['mean'], stats['stdev']
 
-        def _gather_stats(offsets: Tensor, n_out: int):
+        def _gather_one(src: Tensor, offsets: Tensor, n_out: int):
             """
             Gather [B*n_blocks, n_out, C, X+1] from [B, S, C, X+1] without
             materializing a per-block copy of the full series: index in the
@@ -591,11 +651,12 @@ class ForkingSequences:
             """
             idx = ws.unsqueeze(-1) + offsets.view(1, 1, -1)
             idx = idx.reshape(B, n_blocks * n_out)
-            idx = idx.unsqueeze(-1).unsqueeze(-1).expand(B, n_blocks * n_out, *mean.shape[2:])
-            return (
-                mean.gather(1, idx).reshape(B * n_blocks, n_out, *mean.shape[2:]),
-                stdev.gather(1, idx).reshape(B * n_blocks, n_out, *stdev.shape[2:]),
-            )
+            idx = idx.unsqueeze(-1).unsqueeze(-1).expand(B, n_blocks * n_out, *src.shape[2:])
+            return src.gather(1, idx).reshape(B * n_blocks, n_out, *src.shape[2:])
+
+        def _gather_stats(offsets: Tensor, n_out: int):
+            return (_gather_one(mean, offsets, n_out),
+                    _gather_one(stdev, offsets, n_out))
 
         # Per-timestep stats for norm
         ts_offsets = torch.arange(enc_size, device=x_full.device)
@@ -604,6 +665,18 @@ class ForkingSequences:
         # Per-FCD stats for denorm/norm_targets
         fcd_offsets = torch.arange(valid_fcds, device=x_full.device) * self.stride + eff_L - 1
         fcd_mean, fcd_stdev = _gather_stats(fcd_offsets, valid_fcds)
+
+        # A window whose normalization context contains no real observations
+        # has no usable statistics: _compute_norm_stats falls back to mean 0
+        # and stdev sqrt(eps)~0.003, which divides a real target by ~0.003 and
+        # inflates it ~300x. Such a window is not a legitimate training
+        # example, so drop it from the loss exactly as geometrically-invalid
+        # windows are dropped. On heavily left-padded short series this is a
+        # large fraction of windows (~40% on M-competition yearly), and those
+        # windows otherwise dominate the reported loss.
+        fcd_count   = _gather_one(stats['count'], fcd_offsets, valid_fcds)
+        has_history = (fcd_count[..., 0] >= MIN_NORM_OBS).unsqueeze(2)  # [B*nb, n_fcds, 1, C]
+        outsample_mask = outsample_mask * has_history.to(outsample_mask.dtype)
 
         channel_mask = batch['channel_mask']
         if n_blocks > 1:
@@ -667,7 +740,8 @@ class ForkingSequences:
 
         if self.norm_window_size == -1:
             # Causal: cumulative stats from 0..t
-            counts  = torch.cumsum(mask_full, dim=1).clamp(min=1)
+            raw_counts = torch.cumsum(mask_full, dim=1)
+            counts  = raw_counts.clamp(min=1)
             mean    = torch.cumsum(x_full * mask_full, dim=1) / counts
             mean_sq = torch.cumsum((x_full ** 2) * mask_full, dim=1) / counts
         else:
@@ -675,19 +749,25 @@ class ForkingSequences:
             W = min(self.norm_window_size, S)
             x_windows    = x_full.unfold(1, W, 1)        # [B, S-W+1, C, X+1, W]
             mask_windows = mask_full.unfold(1, W, 1)      # [B, S-W+1, C, X+1, W]
-            counts  = mask_windows.sum(dim=-1).clamp(min=1)
+            raw_counts = mask_windows.sum(dim=-1)
+            counts  = raw_counts.clamp(min=1)
             mean    = (x_windows * mask_windows).sum(dim=-1) / counts
             mean_sq = ((x_windows ** 2) * mask_windows).sum(dim=-1) / counts
 
             # Pad early positions (0..W-2) with causal stats as fallback
             if W > 1:
                 early_mask    = mask_full[:, :W-1]
-                early_counts  = torch.cumsum(early_mask, dim=1).clamp(min=1)
+                early_raw     = torch.cumsum(early_mask, dim=1)
+                early_counts  = early_raw.clamp(min=1)
                 early_mean    = torch.cumsum(x_full[:, :W-1] * early_mask, dim=1) / early_counts
                 early_mean_sq = torch.cumsum((x_full[:, :W-1] ** 2) * early_mask, dim=1) / early_counts
                 mean    = torch.cat([early_mean, mean], dim=1)
                 mean_sq = torch.cat([early_mean_sq, mean_sq], dim=1)
-                counts  = torch.cat([early_counts, counts], dim=1)
+                raw_counts = torch.cat([early_raw, raw_counts], dim=1)
 
         stdev = torch.sqrt((mean_sq - mean ** 2).clamp(min=0) + eps)
-        return {'mean': mean, 'stdev': stdev}
+        # 'count' is the UNCLAMPED number of real observations behind each
+        # statistic. count==0 means the normalization window held no real data,
+        # so mean/stdev are the degenerate fallback (0, sqrt(eps)) rather than
+        # anything measured — callers use it to drop those windows.
+        return {'mean': mean, 'stdev': stdev, 'count': raw_counts}
