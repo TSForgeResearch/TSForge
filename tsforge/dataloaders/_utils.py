@@ -166,7 +166,9 @@ def _extend_with_next_split(df: pd.DataFrame, next_df: pd.DataFrame, horizon: in
         return df
     extension = (
         next_df.groupby("unique_id", sort=False)
-        .head(horizon)
+        # H-1, not H: an H-th row only adds one FCD whose whole horizon is
+        # masked, i.e. a window that costs compute but contributes zero loss.
+        .head(horizon - 1)
         .copy()
     )
     extension["available_mask"] = 0.0

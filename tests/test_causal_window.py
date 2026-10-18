@@ -503,3 +503,31 @@ if __name__ == "__main__":
         t()
         print(f"PASS: {t.__name__}")
     print(f"\n{len(tests)} tests passed.")
+
+
+def test_val_fcd_sampling_fixed_across_checks():
+    """
+    fcd_samples_val draws starts with the training sampler but keyed on the
+    val batch index, so repeated val checks score identical windows no matter
+    what was sampled in between (e.g. training steps on the same forker seed).
+    """
+    B, T, C, X1 = 4, 60, 1, 1
+    L, H, stride, N = 8, 4, 2, 3
+    torch.manual_seed(0)
+    batch = dict(
+        x_enc=torch.randn(B, T, C, X1),
+        available_mask=torch.ones(B, T, C),
+        loss_mask=torch.ones(B, T, C),
+        channel_mask=torch.ones(B, C),
+    )
+    fs = ForkingSequences(context_len=L, fcd_samples=N, patch_len=2, stride=stride, fcd_seed=1)
+
+    first = [fs(batch, horizon=H, fcd_samples=N, step=i)["outsample_y"] for i in range(3)]
+    fs(batch, horizon=H, fcd_samples=N, step=123)  # unrelated draw in between
+    second = [fs(batch, horizon=H, fcd_samples=N, step=i)["outsample_y"] for i in range(3)]
+
+    for a, b in zip(first, second):
+        assert torch.equal(a, b)
+    # distinct batch indices give distinct (not one shared) draws
+    assert not torch.equal(first[0], first[1])
+    assert first[0].shape[1] == N

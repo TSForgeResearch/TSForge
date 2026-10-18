@@ -208,6 +208,36 @@ class BaseModel(nn.Module):
             blocked = fcd_samples_eval != -1,
         )
 
+        # Validation-only FCD budget. Exhaustive val (all FCDs of every series)
+        # is the dominant eval cost at foundation-model scale; this instead
+        # takes one training-shaped block of N FCDs per series. The start is
+        # drawn with the training sampler but keyed on (seed, val batch index),
+        # never global_step, so every val check scores the identical windows
+        # and val loss moves only with the model — safe for early stopping.
+        # Only rank 0 validates, so config.seed needs no +rank offset here.
+        fcd_samples_val = getattr(config, "fcd_samples_val", None)
+        if fcd_samples_val is not None:
+            if not isinstance(fcd_samples_val, int) or fcd_samples_val < 1:
+                raise ValueError(
+                    f"fcd_samples_val must be null or a positive int; got {fcd_samples_val!r}."
+                )
+            if config.fcd_samples != -1 and fcd_samples_val > config.fcd_samples:
+                raise ValueError(
+                    f"fcd_samples_val={fcd_samples_val} exceeds fcd_samples="
+                    f"{config.fcd_samples}: val blocks would span more history "
+                    "than any training block."
+                )
+        self.fcd_samples_val = fcd_samples_val
+        self._fork_sequences_val = None if fcd_samples_val is None else ForkingSequences(
+            context_len = config.context_len,
+            fcd_samples = fcd_samples_val,
+            patch_len = config.patch_len,
+            stride = config.stride,
+            fcd_sampler = config.fcd_sampler,
+            norm_window_size = norm_window_size,
+            fcd_seed = getattr(config, "seed", 0),
+        )
+
         loss_fn = get_loss(config.loss)
         if hasattr(config, "quantiles") and config.quantiles:
             loss_fn.quantiles = list(config.quantiles)
@@ -319,7 +349,9 @@ class BaseModel(nn.Module):
         }
 
 
-    def _prepare_batch(self, raw_batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    def _prepare_batch(
+        self, raw_batch: Dict[str, Tensor], val_idx: Optional[int] = None,
+    ) -> Dict[str, Tensor]:
         raw_batch = self._to_device(raw_batch)
         horizon_override = getattr(self.mcfg, "horizon_override", None)
         horizon = int(horizon_override) if horizon_override else int(raw_batch["horizon"][0].item())
@@ -327,6 +359,18 @@ class BaseModel(nn.Module):
             fcd_samples = self._get_fcd_samples()
             return self._fork_sequences_train(
                 raw_batch, horizon, fcd_samples=fcd_samples, step=self.global_step,
+            )
+        if val_idx is not None and self._fork_sequences_val is not None:
+            # step=val_idx: batch i of the (unshuffled, built-once) val loader
+            # always holds the same series and now always draws the same
+            # starts. Clamp to the FCDs the batch can hold (short val splits,
+            # e.g. yearly val_size=6).
+            fs = self._fork_sequences_val
+            L = fs.context_len if fs.context_len != -1 else fs.patch_len
+            n_avail = (raw_batch["x_enc"].shape[1] - L - horizon) // fs.stride + 1
+            return fs(
+                raw_batch, horizon,
+                fcd_samples=min(self.fcd_samples_val, n_avail), step=val_idx,
             )
         return self._fork_sequences_eval(raw_batch, horizon, fcd_samples=self.fcd_samples_eval)
 
@@ -370,10 +414,10 @@ class BaseModel(nn.Module):
         return loss.item()
 
     @torch.no_grad()
-    def val_step(self, raw_batch: Dict[str, Tensor]) -> float:
+    def val_step(self, raw_batch: Dict[str, Tensor], val_idx: Optional[int] = None) -> float:
         self._assert_training_ready()
         self.eval()
-        batch = self._prepare_batch(raw_batch)
+        batch = self._prepare_batch(raw_batch, val_idx=val_idx)
         batch = self.scaler(batch, norm_type='norm')
         batch["preds"] = self(batch)
         _, loss = self.compute_loss(batch)  # handles denorm internally
@@ -386,8 +430,8 @@ class BaseModel(nn.Module):
         results: Dict[str, Dict[str, float]] = {}
         for name, loader in self.val_loaders.items():
             total, n = 0.0, 0
-            for raw_batch in loader:
-                total += self.val_step(raw_batch)
+            for i, raw_batch in enumerate(loader):
+                total += self.val_step(raw_batch, val_idx=i)
                 n += 1
             results[name] = {"loss": total / n if n > 0 else float("nan")}
         return results

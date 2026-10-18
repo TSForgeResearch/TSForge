@@ -51,6 +51,10 @@ fcd_samples_eval: null # Two modes only:
                        #         faster, but later windows draw on more history
                        #         than any training block held.
                        # Any other value is rejected.
+fcd_samples_val: null  # Validation-only FCD budget (test/predict use fcd_samples_eval):
+                       #   null: validate on all FCDs, exactly like test.
+                       #   N>0:  one block of N FCDs per series, start drawn like
+                       #         training but fixed across val checks. N <= fcd_samples.
 fcd_sampler: heterogeneous
 loss: "quantile"
 loss_reduction: per_series  # 'per_series' | 'flat'
