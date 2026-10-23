@@ -51,7 +51,7 @@ def excess_volatility(targets, preds, quantiles, stride=1, scaling=True, mask=No
 
     For each overlapping window pair (ŷ_before, ŷ_update) predicting the same
     target date:
-    - revision_cost   = QL(ŷ_update_median, ŷ_before)  how much ŷ_before mispredicts ŷ_update
+    - revision_cost   = QL(ŷ_update, ŷ_before)         how much ŷ_before mispredicts ŷ_update
     - accuracy_before = QL(y, ŷ_before)                 error of older forecast vs truth
     - accuracy_update = QL(y, ŷ_update)                 error of newer forecast vs truth
 
@@ -170,7 +170,9 @@ def forecast_percentage_change(preds, stride=1, symmetric=True, mask=None, eps=1
     Parameters
     ----------
     preds : np.ndarray [B, T, H, C]
-        Point predictions across T forecast windows.
+        Point predictions across T forecast windows. To score a quantile forecast,
+        pass a single quantile slice; the paper reports the median, since outer
+        quantiles are expected to shift inward as uncertainty shrinks across FCDs.
     stride : int
         Step size between consecutive forecast windows. Must be < H, otherwise
         target dates have at most one forecast and stability is undefined.
