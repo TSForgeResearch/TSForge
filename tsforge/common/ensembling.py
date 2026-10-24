@@ -111,8 +111,13 @@ class Ensembler:
         d_grid = t_grid * self.stride + h_grid  # same index grid as scatter 
         return ensembled_preds[:, d_grid, h_grid, :]  # gather → (B, T, H, C)
 
+    def _steps(self, window_size):
+        """window_size counts FCDs, which sit `stride` horizon steps apart."""
+        return None if window_size is None else (window_size - 1) * self.stride + 1
+
     def _cumulative_mean(self, preds, window_size=None, **kwargs):
         _, H, _ = preds.shape
+        window_size = self._steps(window_size)
         if window_size is None:
             cumsum = np.nancumsum(preds, axis=1)
             counts = np.cumsum(~np.isnan(preds), axis=1)
@@ -125,20 +130,23 @@ class Ensembler:
 
     def _cumulative_median(self, preds, window_size=None, **kwargs):
         _, H, _ = preds.shape
+        window_size = self._steps(window_size)
         return np.stack([
             np.nanmedian(preds[:, max(0, h-window_size+1) if window_size else 0:h+1, :], axis=1)
             for h in range(H)
         ], axis=1)
 
     def _cumulative_ewm(self, preds, alpha=0.5, window_size=None, **kwargs):
+        # weight (1 - alpha)**k for the forecast k FCDs back, as in pandas ewm(alpha=);
+        # FCDs sit `stride` horizon steps apart, so the per-step decay is the stride-th root
+        if not 0 < alpha <= 1:
+            raise ValueError(f"alpha={alpha} must be in (0, 1].")
         B, H, C = preds.shape
-        beta   = np.log(alpha / (1 - alpha))
-        W      = window_size if window_size is not None else H
+        W      = self._steps(window_size) or H
+        decay  = (1 - alpha) ** (1 / self.stride)
         h_idx  = np.arange(H)
-        i_idx  = np.arange(H)
-        starts = np.maximum(0, h_idx - W + 1)
-        mask   = (i_idx[None, :] >= starts[:, None]) & (i_idx[None, :] <= h_idx[:, None])
-        weight_matrix = np.where(mask, np.exp(beta * (i_idx[None, :] - starts[:, None])), 0.0)
+        lag    = h_idx[:, None] - h_idx[None, :]  # (current, pooled)
+        weight_matrix = np.where((lag >= 0) & (lag < W), decay ** np.abs(lag), 0.0)
         valid         = ~np.isnan(preds)
         preds_clean   = np.nan_to_num(preds)
         weighted_sum  = np.einsum('hi,bic->bhc', weight_matrix, valid * preds_clean)

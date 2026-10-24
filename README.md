@@ -559,7 +559,7 @@ law of large numbers.
 |---|---|---|
 | `mean`     | Cumulative (or windowed) mean over overlapping windows   | `window_size=None` |
 | `median`   | Cumulative (or windowed) median — robust to outlier windows | `window_size=None` |
-| `ewm`      | Exponentially weighted mean — recency-biased             | `alpha=0.5`, `window_size=None` |
+| `ewm`      | Exponentially weighted mean — weight `(1-alpha)**k` for the forecast `k` windows back, as in pandas `ewm(alpha=)` | `alpha=0.5`, `window_size=None` |
 | `identity` | No aggregation — pass-through                           | — |
 
 `window_size=None` uses all available overlapping windows. Set an integer

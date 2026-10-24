@@ -122,9 +122,13 @@ class Ensembler(nn.Module):
 
     # --- ensembling strategies (torch versions) ---
 
+    def _steps(self, window_size):
+        """ensemble_window_size counts FCDs, which sit `stride` horizon steps apart."""
+        return None if window_size is None else (window_size - 1) * self.stride + 1
+
     def _cumulative_mean(self, preds):
         valid = ~torch.isnan(preds)
-        W = self.ensemble_window_size
+        W = self._steps(self.ensemble_window_size)
         if W is None or W >= preds.shape[1]:
             total = torch.nan_to_num(preds).cumsum(dim=1)
             counts = valid.to(preds.dtype).cumsum(dim=1)
@@ -143,7 +147,7 @@ class Ensembler(nn.Module):
 
     def _cumulative_median(self, preds):
         H = preds.shape[1]
-        W = self.ensemble_window_size
+        W = self._steps(self.ensemble_window_size)
         start = (lambda i: max(0, i - W + 1)) if W else (lambda i: 0)
         # nanquantile(0.5) averages the two middle values for an even-sized pool, which
         # is what np.nanmedian does; torch.nanmedian would return the lower one instead.
@@ -155,18 +159,19 @@ class Ensembler(nn.Module):
     def _cumulative_ewm(self, preds):
         _, H, _ = preds.shape
         alpha = self.alpha
+        if not 0 < alpha <= 1:
+            raise ValueError(f"alpha={alpha} must be in (0, 1].")
         dtype, device = preds.dtype, preds.device
-        beta = torch.log(torch.tensor(alpha / (1 - alpha), dtype=dtype, device=device))
-        W = self.ensemble_window_size if self.ensemble_window_size is not None else H
+        W = self._steps(self.ensemble_window_size) or H
 
+        # weight (1 - alpha)**k for the forecast k FCDs back, as in pandas ewm(alpha=);
+        # FCDs sit `stride` horizon steps apart, so the per-step decay is the stride-th root
+        decay = (1 - alpha) ** (1 / self.stride)
         h_idx = torch.arange(H, device=device)
-        i_idx = torch.arange(H, device=device)
-        starts = torch.clamp(h_idx - W + 1, min=0)
-        in_window = (i_idx[None, :] >= starts[:, None]) & (i_idx[None, :] <= h_idx[:, None])
-
+        lag = h_idx[:, None] - h_idx[None, :]  # (current, pooled)
         weight_matrix = torch.where(
-            in_window,
-            torch.exp(beta * (i_idx[None, :] - starts[:, None]).to(dtype)),
+            (lag >= 0) & (lag < W),
+            decay ** lag.abs().to(dtype),
             torch.zeros((), dtype=dtype, device=device),
         )
         valid = ~torch.isnan(preds)
