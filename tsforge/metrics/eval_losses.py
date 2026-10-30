@@ -133,3 +133,62 @@ def crps(
         score = score / (denom + eps)
 
     return score
+
+
+def mase(
+    preds:    np.ndarray,               # [B, T, H, C]
+    targets:  np.ndarray,               # [B, T, H, C]
+    insample: np.ndarray,               # [B, L, C] or [B, T, L, C]
+    seasonality: int = 1,
+    mask:     np.ndarray | None = None, # [B, T, H, C]
+    eps:      float = 1e-8,
+) -> float:
+    """
+    MASE = (1 / H) * Σ_h |y_{t+h} - ŷ_{t+h}| / ((1 / (T-m)) * Σ_j |y_j - y_{j-m}|)
+
+    Scale is the in-sample seasonal naive MAE per series/channel (and per
+    forecast creation date if insample is [B, T, L, C]). NaNs in insample are ignored.
+    """
+    scale = np.nanmean(np.abs(insample[..., seasonality:, :] - insample[..., :-seasonality, :]),
+                       axis=-2)                                # [B, C] or [B, T, C]
+    if scale.ndim == 2:
+        scale = scale[:, np.newaxis, :]                        # [B, 1, C]
+    scale = scale[..., np.newaxis, :]                          # [B, T|1, 1, C]
+
+    err = np.abs(preds - targets) / (scale + eps)              # [B, T, H, C]
+    if mask is None:
+        return err.mean()
+
+    # Per-series MASE over valid horizon steps, then equal-weight mean (M4 / NF style)
+    n     = mask.sum(axis=2)                                   # [B, T, C]
+    valid = n > 0
+    score = (err * mask).sum(axis=2)[valid] / n[valid]
+    return score.mean() if valid.any() else 0.0
+
+
+def wql(
+    preds:     np.ndarray,             # [B, T, H, C, Q]
+    targets:   np.ndarray,             # [B, T, H, C]
+    quantiles: list[float],
+    mask:      np.ndarray | None = None,
+    eps:       float = 1e-8,
+) -> float:
+    """
+    WQL = (2 / |Q|) * Σ_q Σ_h QL_q(y_{t+h}, ŷ^(q)_{t+h}) / Σ_h |y_{t+h}|
+
+    Computed per series/window/channel (sum over H), then averaged.
+    For the dataset-level version (sums over all series), use crps(..., scale=True).
+    """
+    errors = targets[..., np.newaxis] - preds                  # [B, T, H, C, Q]
+    q      = np.array(quantiles, dtype=preds.dtype)
+    loss   = np.maximum(q * errors, (q - 1) * errors).mean(-1) # [B, T, H, C]
+    absy   = np.abs(targets)
+
+    if mask is not None:
+        loss, absy = loss * mask, absy * mask
+        valid = mask.sum(axis=2) > 0                           # [B, T, C]
+    else:
+        valid = np.ones(loss.shape[:2] + loss.shape[3:], dtype=bool)
+
+    score = 2 * loss.sum(axis=2) / (absy.sum(axis=2) + eps)   # [B, T, C]
+    return score[valid].mean() if valid.any() else 0.0
