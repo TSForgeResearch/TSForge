@@ -181,6 +181,33 @@ class Transpose(nn.Module):
         else:
             return x.transpose(*self.dims)
 
+def _causal_len_token_num(config) -> int:
+    """
+    context_len in patch units: the causal lookback band shared by attention
+    (`_make_causal_token_mask`) and the MICA memory. None when context_len == -1
+    (full context) → unrestricted causal.
+    """
+    if config.context_len > 0:
+        return int((config.context_len - config.patch_len) / config.stride + 1)
+    return None
+
+
+def _banded_causal_sum(x: torch.Tensor, dim: int, causal_len_token_num: int = None) -> torch.Tensor:
+    """
+    out_i = Σ_{j ∈ [i - causal_len_token_num + 1, i]} x_j along `dim`, computed as a
+    cumulative sum minus the cumulative sum causal_len_token_num steps back. Same band
+    as `_make_causal_token_mask`; None → plain cumulative (unrestricted causal) sum.
+    """
+    out = x.cumsum(dim)
+    n = x.shape[dim]
+    if causal_len_token_num is None or causal_len_token_num >= n:
+        return out
+    shifted = torch.cat([
+        torch.zeros_like(out.narrow(dim, 0, causal_len_token_num)),
+        out.narrow(dim, 0, n - causal_len_token_num),
+    ], dim=dim)
+    return out - shifted
+
 def _make_causal_token_mask(
     key_padding_mask: torch.Tensor,  # [B, C, L] — 1/True = VALID, 0/False = INVALID
     device: torch.device,

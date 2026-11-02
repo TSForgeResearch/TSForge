@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional
 
-from ..common._modules import MLP
+from ..common._modules import MLP, _causal_len_token_num, _banded_causal_sum
 
 
 class MICAScaledDotProductAttention(nn.Module):
@@ -31,6 +31,9 @@ class MICAScaledDotProductAttention(nn.Module):
         self.inner_dim = config.n_heads * d_v
 
         self.elu = nn.ELU()
+        # Memory is causal with the same context_len band as the attention mask:
+        # patch i's memory only holds keys/values of patches [i-W+1, i].
+        self.causal_len_token_num = _causal_len_token_num(config)
         
         # Select memory update/retrieval methods based on channel exclusion
         if config.mica_channel_exclusion:
@@ -100,51 +103,53 @@ class MICAScaledDotProductAttention(nn.Module):
         return torch.softmax(weights, dim=1)
     
     def _compute_query_channel_weights(self, query_states, channel_mask):
-        # query_states: [B, C, H, P, D]
-        q_pooled = query_states.mean(dim=3)   # [B, C, H, D]
-        scores = self.channel_attn(q_pooled)  # [B, C, H, 1]
-        mask = channel_mask.float().view(channel_mask.shape[0], channel_mask.shape[1], 1, 1)
+        # query_states: [B, C, H, P, D] — pooled causally over each patch's band
+        P = query_states.shape[3]
+        ones = torch.ones(P, 1, device=query_states.device, dtype=query_states.dtype)
+        count = _banded_causal_sum(ones, dim=0, causal_len_token_num=self.causal_len_token_num)  # [P, 1]
+        q_pooled = _banded_causal_sum(query_states, dim=3, causal_len_token_num=self.causal_len_token_num) / count  # [B, C, H, P, D]
+        scores = self.channel_attn(q_pooled)  # [B, C, H, P, 1]
+        mask = channel_mask.float().view(channel_mask.shape[0], channel_mask.shape[1], 1, 1, 1)
         scores = scores.masked_fill(mask == 0, float('-inf'))
 
-        return torch.softmax(scores, dim=1).unsqueeze(-1)  # [B, C, H, 1, 1]
+        return torch.softmax(scores, dim=1)  # [B, C, H, P, 1]
+
+    def _banded_memory(self, key_states, value_states, key_padding_mask):
+        """Per-channel causal memory: M_i = Σ_{j in band(i)} σ(k_j) v_jᵀ, z_i = Σ σ(k_j)."""
+        pad_mask = key_padding_mask.unsqueeze(2).unsqueeze(-1)  # [B, C, 1, P, 1]
+        sigma_k = (self.elu(key_states) + 1.0) * pad_mask  # [B, C, H, P, D]
+        kv = sigma_k.unsqueeze(-1) * (value_states * pad_mask).unsqueeze(-2)  # [B, C, H, P, D, D]
+
+        memory_matrix = _banded_causal_sum(kv, dim=3, causal_len_token_num=self.causal_len_token_num)  # [B, C, H, P, D, D]
+        z = _banded_causal_sum(sigma_k, dim=3, causal_len_token_num=self.causal_len_token_num)  # [B, C, H, P, D]
+        return memory_matrix, z
 
     def _update_memory_matrix_allchannels(self, key_states, value_states, query_states, key_padding_mask, channel_mask):
-        w = self._compute_channel_weights(query_states, channel_mask)
+        w = self._compute_channel_weights(query_states, channel_mask)  # [B, C, H, 1|P, 1]
+        per_channel_mm, per_channel_z = self._banded_memory(key_states, value_states, key_padding_mask)
 
-        pad_mask = key_padding_mask.unsqueeze(2).unsqueeze(-1)  # [B, C, 1, L, 1]
-        sigma_k = (self.elu(key_states) + 1.0) * pad_mask  # [B, C, H, P, D]
-        sigma_k_T = sigma_k.transpose(-2, -1)  # [B, C, H, D, P]
- 
-        memory_matrix = torch.matmul(sigma_k_T, value_states * pad_mask)          # [B, C, H, D, D]
-        memory_matrix = (w * memory_matrix).sum(dim=1, keepdim=True)   # [B, 1, H, D, D]
- 
-        z = sigma_k.sum(dim=-2).unsqueeze(-1)   # [B, C, H, D, 1]
-        z = (w * z).sum(dim=1, keepdim=True)    # [B, 1, H, D, 1]
-    
+        memory_matrix = (w.unsqueeze(-1) * per_channel_mm).sum(dim=1, keepdim=True)  # [B, 1, H, P, D, D]
+        z = (w * per_channel_z).sum(dim=1, keepdim=True)                           # [B, 1, H, P, D]
+
         return memory_matrix, z
 
     def _update_memory_matrix_channelexl(self, key_states, value_states, query_states, key_padding_mask, channel_mask):
-        w = self._compute_channel_weights(query_states, channel_mask)
+        w = self._compute_channel_weights(query_states, channel_mask)  # [B, C, H, 1|P, 1]
+        per_channel_mm, per_channel_z = self._banded_memory(key_states, value_states, key_padding_mask)
 
-        pad_mask = key_padding_mask.unsqueeze(2).unsqueeze(-1)  # [B, C, 1, L, 1]
-        sigma_k = (self.elu(key_states) + 1.0)  * pad_mask # [B, C, H, P, D]
-        sigma_k_T = sigma_k.transpose(-2, -1)  # [B, C, H, D, P]
- 
         C = key_states.shape[1]
-        per_channel_mm = torch.matmul(sigma_k_T, value_states * pad_mask)             # [B, C, H, D, D]
-        weighted_sum = (w * per_channel_mm).sum(dim=1, keepdim=True)       # [B, 1, H, D, D]
-        memory_matrix = weighted_sum.expand(-1, C, -1, -1, -1) - w * per_channel_mm  # [B, C, H, D, D]
- 
-        per_channel_z = sigma_k.sum(dim=-2).unsqueeze(-1)                  # [B, C, H, D, 1]
-        weighted_z_sum = (w * per_channel_z).sum(dim=1, keepdim=True)      # [B, 1, H, D, 1]
-        z = weighted_z_sum.expand(-1, C, -1, -1, -1) - w * per_channel_z  # [B, C, H, D, 1]
+        weighted_mm = w.unsqueeze(-1) * per_channel_mm                                 # [B, C, H, P, D, D]
+        memory_matrix = weighted_mm.sum(dim=1, keepdim=True).expand(-1, C, -1, -1, -1, -1) - weighted_mm
+
+        weighted_z = w * per_channel_z                                                 # [B, C, H, P, D]
+        z = weighted_z.sum(dim=1, keepdim=True).expand(-1, C, -1, -1, -1) - weighted_z
 
         return memory_matrix, z
 
     def retrieve_from_memory(self, query_states, memory_matrix, z, key_padding_mask, channel_mask):
         sigma_q = self.elu(query_states) + 1.0  # [B, C, H, P, D]
-        numerator = sigma_q @ memory_matrix         # [B, C, H, P, D]
-        denominator = (sigma_q @ z) + 1e-6 # [B, C, H, P, 1]
+        numerator = (sigma_q.unsqueeze(-2) @ memory_matrix).squeeze(-2)  # [B, C, H, P, D]
+        denominator = (sigma_q * z).sum(dim=-1, keepdim=True) + 1e-6     # [B, C, H, P, 1]
         A_mem = numerator / denominator             # [B, C, H, P, D]
 
         # Zero out padded timesteps

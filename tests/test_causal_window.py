@@ -481,6 +481,93 @@ def test_fcd_samples_eval_accepts_only_two_modes():
             raise AssertionError(f"fcd_samples_eval={bad!r} should have been rejected")
 
 
+def _make_mica_config(weight_type="uniform", exclusion=False, n_channels=2, **kw):
+    cfg = _make_encoder_config(**kw)
+    cfg.mica_mixer_type = "betas"
+    cfg.mica_channel_weight_type = weight_type
+    cfg.mica_channel_exclusion = exclusion
+    cfg.channelwise_beta = False
+    cfg.n_channels = n_channels
+    return cfg
+
+
+@torch.no_grad()
+def test_mica_memory_matches_masked_brute_force():
+    """
+    MICA's memory for patch i must equal linear attention restricted to the same
+    band as the attention mask: Σ_c w_c Σ_{j ∈ [i-W+1, i], valid} σ(k_cj) v_cjᵀ
+    (own channel removed under channel exclusion).
+    """
+    from tsforge.attention._mica_attention import MICAScaledDotProductAttention
+
+    B, C, H, P, D, W = 2, 3, 2, 9, 4, 3
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(B, C, H, P, D) for _ in range(3))
+    kpm = torch.ones(B, C, P)
+    kpm[0, 1, :2] = 0                                 # left padding on one channel
+    cm = torch.ones(B, C)
+    band = _make_causal_token_mask(kpm, device=torch.device("cpu"), causal_len_token_num=W)[:, :, 0]  # [B, C, P, P]
+
+    for exclusion in (False, True):
+        cfg = _make_mica_config("uniform", exclusion, n_channels=C, context_len=W * 2, patch_len=2, stride=2)
+        attn = MICAScaledDotProductAttention(cfg, d_k=D, d_v=D)
+        assert attn.causal_len_token_num == W
+
+        mm, z = attn._update_memory_matrix(k, v, q, kpm, cm)
+        got = attn.retrieve_from_memory(q, mm, z, kpm, cm)
+
+        sk, sq = attn.elu(k) + 1, attn.elu(q) + 1
+        exp = torch.zeros_like(got)
+        for b in range(B):
+            for cq in range(C):
+                for h in range(H):
+                    for i in range(P):
+                        num, den = torch.zeros(D), torch.zeros(())
+                        for c in range(C):
+                            if exclusion and c == cq:
+                                continue
+                            for j in range(P):
+                                if band[b, c, i, j]:
+                                    num += (sq[b, cq, h, i] @ sk[b, c, h, j]) * v[b, c, h, j]
+                                    den += sq[b, cq, h, i] @ sk[b, c, h, j]
+                        exp[b, cq, h, i] = num / (den + 1e-6) * kpm[b, cq, i]
+        assert torch.allclose(got, exp, atol=1e-4), f"exclusion={exclusion}"
+
+
+@torch.no_grad()
+def test_mica_encoder_is_causal_and_capped():
+    """
+    With MICA on, a one-layer shared pass must still give each patch exactly the
+    independent context_len-window result: no future patches and nothing beyond
+    the band leak in through the memory or the (dynamic) channel weights.
+    """
+    C, long_len, probe = 2, 20, 10
+    for weight_type in ("uniform", "static", "dynamic"):
+        for exclusion in (False, True):
+            cfg = _make_mica_config(weight_type, exclusion, n_channels=C, context_len=8, patch_len=2, stride=2)
+            cfg.n_layers = 1
+            enc = TSTEncoder(cfg).eval()
+            W = enc.causal_len_token_num
+            torch.manual_seed(1)
+            x = torch.randn(C, long_len, cfg.hidden_size)
+            cm = torch.ones(1, C)
+
+            def run(xx):
+                return enc(x=xx, n_channels=C, key_padding_mask=torch.ones(1, C, xx.shape[1]), channel_mask=cm)
+
+            shared = run(x)
+            window = run(x[:, probe - W + 1:probe + 1])
+            assert torch.allclose(shared[:, probe], window[:, -1], atol=1e-5), (
+                f"{weight_type}/excl={exclusion}: shared pass != independent window"
+            )
+
+            x_future = x.clone()
+            x_future[:, probe + 1:] += 100.0
+            assert torch.allclose(shared[:, :probe + 1], run(x_future)[:, :probe + 1], atol=1e-5), (
+                f"{weight_type}/excl={exclusion}: future patches leak into the past"
+            )
+
+
 if __name__ == "__main__":
     tests = [
         test_banded_mask_matches_sliding_window,
@@ -498,6 +585,8 @@ if __name__ == "__main__":
         test_norm_stats_are_causal,
         test_norm_fcd_stats_sit_on_forecast_origin,
         test_fcd_samples_eval_accepts_only_two_modes,
+        test_mica_memory_matches_masked_brute_force,
+        test_mica_encoder_is_causal_and_capped,
     ]
     for t in tests:
         t()

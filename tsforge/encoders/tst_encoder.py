@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Optional
 
 from ..attention._attention_layer import MultiheadAttention
-from ..common._modules import Transpose, _make_causal_token_mask
+from ..common._modules import Transpose, _make_causal_token_mask, _causal_len_token_num
 
 def get_activation_fn(activation):
     if callable(activation):
@@ -68,10 +68,7 @@ class TSTEncoder(nn.Module):
         # training's own block_len (context_len + (fcd_samples-1)*stride)
         # instead of running the whole series through one shared pass —
         # see discussion in the PR/commit introducing this comment.
-        self.causal_len_token_num = (
-            int((config.context_len - config.patch_len) / config.stride + 1)
-            if config.context_len > 0 else None
-        )
+        self.causal_len_token_num = _causal_len_token_num(config)
 
     def forward(
         self,
