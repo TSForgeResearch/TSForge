@@ -2,22 +2,16 @@
 
 <p align="center">
   <img src="figures/TSForge_logo.png" width="250"/>
-  </p>
-
+</p>
 
 <p align="center">
   <em>Forge time-series forecasting architectures through controlled, component-level studies</em>
 </p>
 
-<br>
-
----
-
-<br>
-
-![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
-
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11-blue.svg" alt="Python 3.11"/>
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"/>
+</p>
 
 <p align="center">
   <a href="#overview">Overview</a> •
@@ -34,19 +28,22 @@
   <a href="#license">License</a>
 </p>
 
-<br>
-
 ---
-
-<br>
 
 ## Overview
 
 **Most forecasting codebases benchmark at the model level. TSForge benchmarks at the component level.**
 
 <p align="center">
-  <img src="figures/TSForge_motivation.jpg" width="720"/>
+  <a href="figures/TSForge_motivation_light.png">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="figures/TSForge_motivation_dark.png"/>
+      <img src="figures/TSForge_motivation_light.png" width="100%" alt="TSForge component-level study overview"/>
+    </picture>
+  </a>
 </p>
+
+<p align="center"><sub>Each stage is a swappable component. In this example only the encoder varies; everything else is held fixed.</sub></p>
 
 <br>
 
