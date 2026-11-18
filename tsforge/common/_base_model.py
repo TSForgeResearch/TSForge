@@ -148,6 +148,24 @@ class BaseModel(nn.Module):
         self.norm_window_size = norm_window_size
 
         self.fcd_samples = config.fcd_samples
+
+        # Training-only target length. null (default) scores the full horizon.
+        # An int h makes training score only the first h steps of every FCD's
+        # target, and sets batch["horizon"] = h so the model emits only h
+        # steps: next-patch training (TiRex/TimesFM-style, h = output patch
+        # length) without generating and discarding the rest of the horizon.
+        # Window sampling is untouched — FCDs are still drawn with the full
+        # horizon, so every variant sees identical training windows. Val and
+        # test always score the full horizon.
+        loss_horizon = getattr(config, "loss_horizon", None)
+        if loss_horizon is not None and (
+            not isinstance(loss_horizon, int) or loss_horizon < 1
+        ):
+            raise ValueError(
+                f"loss_horizon must be null or a positive int; got {loss_horizon!r}."
+            )
+        self.loss_horizon = loss_horizon
+
         self._fork_sequences_train = ForkingSequences(
             context_len = config.context_len,
             fcd_samples = config.fcd_samples,
@@ -157,12 +175,18 @@ class BaseModel(nn.Module):
             norm_window_size = norm_window_size,
             fcd_seed = getattr(config, "seed", 0),
         )
-        # Eval block size — exactly two sanctioned modes:
+        # Eval block size — exactly three sanctioned modes:
         #   None (default) → mirror fcd_samples, so every eval block has the
         #                    same geometry the model saw at train time.
         #   -1             → the whole series in one shared encoder pass.
         #                    Fastest, but a window late in the series draws on
         #                    more history than any training block held.
+        #   1              → window sampling: every FCD is its own block of
+        #                    exactly context_len + horizon steps, folded into
+        #                    the batch dim. For models trained with forking
+        #                    sequences that need a per-origin window at
+        #                    inference (TiRex-style CPM tokens appended after
+        #                    the context, TimesFM-style AR rollout).
         # Any other value is rejected: it would neither match training nor be
         # maximally efficient, just wrong by an unquantified amount.
         fcd_samples_eval = getattr(config, "fcd_samples_eval", None)
@@ -172,16 +196,27 @@ class BaseModel(nn.Module):
         if fcd_samples_eval != -1:
             if not isinstance(fcd_samples_eval, int) or fcd_samples_eval < 1:
                 raise ValueError(
-                    f"fcd_samples_eval must be null, -1, or a positive int equal "
+                    f"fcd_samples_eval must be null, -1, 1, or a positive int equal "
                     f"to fcd_samples ({config.fcd_samples}); got {fcd_samples_eval!r}."
                 )
-            if fcd_samples_eval != config.fcd_samples:
+            if fcd_samples_eval == 1 and config.fcd_samples != 1:
+                logger.warning(
+                    f"fcd_samples_eval=1 with fcd_samples={config.fcd_samples}: "
+                    "training uses forking sequences but evaluation uses window "
+                    "sampling (one context_len + horizon window per FCD). "
+                    "Intended for models that append tokens or roll out per "
+                    "origin at inference (TiRex/TimesFM-style); for any other "
+                    "model eval geometry differs from training. Eval rows grow "
+                    "to B * n_fcds, so lower valid_batch_size if memory is tight."
+                )
+            elif fcd_samples_eval != config.fcd_samples:
                 raise ValueError(
                     f"fcd_samples_eval={fcd_samples_eval} does not match "
                     f"fcd_samples={config.fcd_samples}. Eval blocks must have the "
                     "same geometry as the training blocks the model was fit on. "
-                    "Use null (mirror training) or -1 (whole series in one pass, "
-                    "faster but sees more history than training did)."
+                    "Use null (mirror training), 1 (window sampling: one window "
+                    "per FCD) or -1 (whole series in one pass, faster but sees "
+                    "more history than training did)."
                 )
 
         self.fcd_samples_eval = fcd_samples_eval
@@ -357,9 +392,15 @@ class BaseModel(nn.Module):
         horizon = int(horizon_override) if horizon_override else int(raw_batch["horizon"][0].item())
         if self.training:
             fcd_samples = self._get_fcd_samples()
-            return self._fork_sequences_train(
+            batch = self._fork_sequences_train(
                 raw_batch, horizon, fcd_samples=fcd_samples, step=self.global_step,
             )
+            if self.loss_horizon is not None and self.loss_horizon < horizon:
+                h = self.loss_horizon
+                batch["outsample_y"]    = batch["outsample_y"][:, :, :h]
+                batch["outsample_mask"] = batch["outsample_mask"][:, :, :h]
+                batch["horizon"]        = h
+            return batch
         if val_idx is not None and self._fork_sequences_val is not None:
             # step=val_idx: batch i of the (unshuffled, built-once) val loader
             # always holds the same series and now always draws the same

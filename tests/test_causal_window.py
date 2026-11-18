@@ -447,11 +447,12 @@ def _model_config(fcd_samples=10, fcd_samples_eval="__unset__"):
     return cfg
 
 
-def test_fcd_samples_eval_accepts_only_two_modes():
+def test_fcd_samples_eval_accepts_only_three_modes():
     """
-    null (or absent) mirrors training; -1 is the legacy whole-series pass.
-    Anything else is rejected — it would neither match training nor be
-    maximally efficient.
+    null (or absent) mirrors training; -1 is the legacy whole-series pass;
+    1 is window sampling (one window per FCD) for forking-sequences-trained
+    models that need a per-origin window at inference. Anything else is
+    rejected — it would neither match training nor be maximally efficient.
     """
     from tsforge.common._base_model import BaseModel
 
@@ -466,19 +467,73 @@ def test_fcd_samples_eval_accepts_only_two_modes():
     assert _Dummy(_model_config(10, -1)).fcd_samples_eval == -1
     # fcd_samples=1 (window-sampling) may of course eval with blocks of 1
     assert _Dummy(_model_config(1, 1)).fcd_samples_eval == 1
+    # FS training + window-sampling eval (TiRex/TimesFM-style): accepted, blocks of 1
+    ws = _Dummy(_model_config(10, 1))
+    assert ws.fcd_samples_eval == 1 and ws._fork_sequences_eval.blocked is True
+    assert _Dummy(_model_config(-1, 1)).fcd_samples_eval == 1
 
     # -1 routes to the legacy non-blocked path, everything else to blocked
     assert _Dummy(_model_config(10, -1))._fork_sequences_eval.blocked is False
     assert _Dummy(_model_config(10, None))._fork_sequences_eval.blocked is True
 
     # rejected
-    for bad in (1, 37, 0, -5, 2.5):
+    for bad in (37, 0, -5, 2.5):
         try:
             _Dummy(_model_config(10, bad))
         except ValueError:
             pass
         else:
             raise AssertionError(f"fcd_samples_eval={bad!r} should have been rejected")
+
+
+def test_loss_horizon_cuts_training_targets_only():
+    """
+    loss_horizon=h scores only the first h steps of every FCD's target in
+    training and tells the model to emit h steps; the sampled windows are the
+    full-horizon ones. Eval is untouched. null keeps the full horizon.
+    """
+    from tsforge.common._base_model import BaseModel
+
+    class _Dummy(BaseModel):
+        def forward(self, batch):
+            return None
+
+    B, T, C, H, h = 2, 40, 1, 6, 2
+    raw = dict(
+        x_enc=torch.randn(B, T, C, 1), available_mask=torch.ones(B, T, C),
+        loss_mask=torch.ones(B, T, C), channel_mask=torch.ones(B, C),
+        horizon=torch.full((B,), H),
+    )
+
+    def _prep(loss_horizon, training):
+        cfg = _model_config(10, None)
+        cfg.loss_horizon = loss_horizon
+        m = _Dummy(cfg)
+        m.mcfg, m.device, m._training_ready = cfg, torch.device("cpu"), True
+        m.seed, m.global_step = 0, 0
+        m.train(training)
+        return m._prepare_batch(dict(raw))
+
+    full, cut = _prep(None, True), _prep(h, True)
+    assert full["horizon"] == H and full["outsample_y"].shape[2] == H
+    assert cut["horizon"] == h
+    assert cut["outsample_y"].shape[2] == h and cut["outsample_mask"].shape[2] == h
+    # same windows: the cut targets are the first h steps of the full ones
+    assert torch.equal(cut["outsample_y"], full["outsample_y"][:, :, :h])
+    assert torch.equal(cut["insample_y"], full["insample_y"])
+    # eval keeps the full horizon
+    ev = _prep(h, False)
+    assert ev["horizon"] == H and ev["outsample_y"].shape[2] == H
+
+    for bad in (0, -1, 2.5):
+        cfg = _model_config(10, None)
+        cfg.loss_horizon = bad
+        try:
+            _Dummy(cfg)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"loss_horizon={bad!r} should have been rejected")
 
 
 def _make_mica_config(weight_type="uniform", exclusion=False, n_channels=2, **kw):
